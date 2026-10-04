@@ -76,11 +76,20 @@ shared memory, then uses signed DP4A in registers. A and transposed B are packed
 on CPU into four-byte groups along K; the final group is zero-padded. Output
 dimensions and K need not be multiples of the tile sizes.
 
+The executable compares two compile-time shared-memory strides: 65 (original
+baseline) and 68. For the cooperative store mapping, stride 68 distributes the
+32 words of a warp over distinct shared-memory banks; stride 65 can map four
+distinct words to the same bank. Both kernels use the same packed inputs,
+output buffer, tile dimensions and validation. Each variant is checked against
+CPU and, for aligned shapes, cuBLAS. Benchmark output includes both timings,
+the stride-68 speedup and each variant's throughput relative to cuBLAS. This
+isolates the padding change; its actual throughput benefit must be measured.
+
 ```sh
 make check-gemm-tiled          # small cases, exhaustive CPU validation
 make run-gemm-tiled            # checks followed by the complete benchmark suite
 ./gemm_tiled --bench           # large benchmarks only
-make sass-gemm-tiled           # inspect gemm_tiled for IDP.4A.S8.S8
+make sass-gemm-tiled           # inspect both specializations for IDP.4A.S8.S8
 ```
 
 The small tests cover 128³/256³/512³, rectangular and tile-boundary cases, zeros,

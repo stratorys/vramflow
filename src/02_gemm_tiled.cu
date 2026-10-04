@@ -21,10 +21,14 @@
 
 // A: [M,ceil(K/4)], BT: [N,ceil(K/4)], with signed four-byte lanes.
 // A block produces 64x64 outputs, consuming 32 scalar K values per tile.
+template <int SharedStride>
 __global__ void gemm_tiled(const int *a, const int *bt, int32_t *c, int m,
                            int k4, int n) {
-  __shared__ int shared_a[8][65];
-  __shared__ int shared_b[8][65];
+  static_assert(SharedStride == 65 || SharedStride == 68, "unsupported stride");
+  // Stride 65 is the original baseline. Stride 68 maps the 32 stores of each
+  // warp to distinct banks for local=index/8 and lane=index%8.
+  __shared__ int shared_a[8][SharedStride];
+  __shared__ int shared_b[8][SharedStride];
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
   const int tid = ty * 16 + tx;
@@ -228,22 +232,32 @@ static bool run_case(cublasHandle_t handle, int m, int k, int n, Input input,
                         packed_bt.size() * sizeof(int),
                         cudaMemcpyHostToDevice));
   const dim3 block(16, 16), grid((n + 63) / 64, (m + 63) / 64);
-  const auto launch_tiled = [&]() {
-    gemm_tiled<<<grid, block>>>(d_packed_a, d_packed_bt, d_c, m, k4, n);
+  const auto launch_tiled = [&](int stride) {
+    if (stride == 65) {
+      gemm_tiled<65><<<grid, block>>>(d_packed_a, d_packed_bt, d_c, m, k4, n);
+    } else {
+      gemm_tiled<68><<<grid, block>>>(d_packed_a, d_packed_bt, d_c, m, k4, n);
+    }
     CUDA_CHECK(cudaGetLastError());
   };
-  launch_tiled();
-  CUDA_CHECK(cudaDeviceSynchronize());
-  CUDA_CHECK(cudaMemcpy(c.data(), d_c, c.size() * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost));
   const char *label = input == Input::Random ? "random"
                       : input == Input::Zero ? "zeros"
                                              : "extremes";
   std::printf("\nM=%d K=%d N=%d input=%s\n", m, k, n, label);
-  bool correct = verify_cpu(a, b, c, m, k, n, benchmark);
-  std::printf("CPU reference (%s): %s\n",
-              benchmark ? "64 positions" : "all outputs",
-              correct ? "PASS" : "FAIL");
+  const auto validate_tiled = [&](int stride) {
+    // Poison the reused output so omitted writes cannot inherit a prior result.
+    CUDA_CHECK(cudaMemset(d_c, 0x80, c.size() * sizeof(int32_t)));
+    launch_tiled(stride);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(c.data(), d_c, c.size() * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost));
+    const bool valid = verify_cpu(a, b, c, m, k, n, benchmark);
+    std::printf("stride=%d CPU reference (%s): %s\n", stride,
+                benchmark ? "64 positions" : "all outputs",
+                valid ? "PASS" : "FAIL");
+    return valid;
+  };
+  bool correct = validate_tiled(65);
 
   // The original row-major matrices satisfy cuBLAS alignment constraints only
   // for these shapes. Odd-sized correctness cases use the CPU reference alone.
@@ -272,31 +286,45 @@ static bool run_case(cublasHandle_t handle, int m, int k, int n, Input input,
     CUDA_CHECK(cudaMemcpy(blas_c.data(), d_blas_c,
                           blas_c.size() * sizeof(int32_t),
                           cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < c.size(); ++i) {
-      if (c[i] != blas_c[i]) {
-        std::fprintf(stderr,
-                     "cuBLAS mismatch at C[%zu,%zu]: tiled=%d cuBLAS=%d\n",
-                     i / n, i % n, int(c[i]), int(blas_c[i]));
-        correct = false;
-        break;
+    const auto compare_outputs = [&](int stride) {
+      bool valid = true;
+      for (size_t i = 0; i < c.size(); ++i) {
+        if (c[i] != blas_c[i]) {
+          std::fprintf(
+              stderr,
+              "stride=%d cuBLAS mismatch at C[%zu,%zu]: tiled=%d cuBLAS=%d\n",
+              stride, i / n, i % n, int(c[i]), int(blas_c[i]));
+          valid = false;
+          break;
+        }
       }
-    }
-    std::printf("cuBLAS reference (all outputs): %s\n",
-                correct ? "PASS" : "FAIL");
+      std::printf("stride=%d cuBLAS reference (all outputs): %s\n", stride,
+                  valid ? "PASS" : "FAIL");
+      return valid;
+    };
+    correct = compare_outputs(65) && validate_tiled(68) && compare_outputs(68);
     if (correct && benchmark) {
-      const double tiled_ms = median_ms(launch_tiled);
+      const double baseline_ms = median_ms([&]() { launch_tiled(65); });
+      const double padded_ms = median_ms([&]() { launch_tiled(68); });
       const double blas_ms = median_ms(launch_blas);
       const double operations = 2.0 * m * n * k;
       std::printf("CPU packing (excluded): %.3f ms\n", pack_ms);
-      std::printf("tiled:  %.4f ms  %.4f TOPS\n", tiled_ms,
-                  operations / (tiled_ms * 1e9));
+      std::printf("tiled stride=65: %.4f ms  %.4f TOPS\n", baseline_ms,
+                  operations / (baseline_ms * 1e9));
+      std::printf("tiled stride=68: %.4f ms  %.4f TOPS\n", padded_ms,
+                  operations / (padded_ms * 1e9));
       std::printf("cuBLAS: %.4f ms  %.4f TOPS\n", blas_ms,
                   operations / (blas_ms * 1e9));
-      std::printf("tiled / cuBLAS throughput: %.3f (%.1f%%)\n",
-                  blas_ms / tiled_ms, 100.0 * blas_ms / tiled_ms);
+      std::printf("stride=68 / stride=65 throughput: %.3f (speedup)\n",
+                  baseline_ms / padded_ms);
+      std::printf("stride=65 / cuBLAS throughput: %.3f (%.1f%%)\n",
+                  blas_ms / baseline_ms, 100.0 * blas_ms / baseline_ms);
+      std::printf("stride=68 / cuBLAS throughput: %.3f (%.1f%%)\n",
+                  blas_ms / padded_ms, 100.0 * blas_ms / padded_ms);
     }
   } else if (correct) {
-    std::printf("cuBLAS reference: skipped (unaligned shape; CPU validated)\n");
+    correct = validate_tiled(68);
+    std::printf("cuBLAS reference: skipped (unaligned shape)\n");
   }
 
   if (d_blas_c)
@@ -339,6 +367,7 @@ int main(int argc, char **argv) {
   std::printf(
       "cuBLAS version: %d\nTile: 64x64x32, 16x16 threads, 4x4 outputs/thread\n",
       version);
+  std::printf("Shared strides: 65 (baseline), 68 (store-bank padding)\n");
   bool correct = true;
   if (check) {
     std::printf("\nCorrectness tests\n");
