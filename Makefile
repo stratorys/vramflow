@@ -4,24 +4,36 @@ ARCH := sm_61
 
 NVCC_FLAGS := \
 	-O3 \
+	-std=c++14 \
 	-arch=$(ARCH) \
 	-lineinfo
 
-TARGET := dp4a
+TARGETS := dp4a gemm_naive
 
-SRC := src/00_dp4a.cu
+.PHONY: all run sass ptx run-gemm-naive sass-gemm-naive clean
 
-all:
-	$(NVCC) $(NVCC_FLAGS) $(SRC) -o $(TARGET)
+all: $(TARGETS)
 
-run: all
-	./$(TARGET)
+dp4a: src/00_dp4a.cu
+	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
-sass: all
-	cuobjdump --dump-sass ./$(TARGET)
+gemm_naive: src/01_gemm_naive.cu src/common.cuh
+	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
-ptx: all
-	cuobjdump --dump-ptx ./$(TARGET)
+run: dp4a
+	./dp4a
+
+sass: dp4a
+	cuobjdump --dump-sass ./dp4a
+
+ptx: dp4a
+	cuobjdump --dump-ptx ./dp4a
+
+run-gemm-naive: gemm_naive
+	./gemm_naive
+
+sass-gemm-naive: gemm_naive
+	cuobjdump --dump-sass ./gemm_naive
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
