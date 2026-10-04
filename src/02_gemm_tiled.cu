@@ -20,15 +20,18 @@
   } while (0)
 
 // A: [M,ceil(K/4)], BT: [N,ceil(K/4)], with signed four-byte lanes.
-// A block produces 64x64 outputs, consuming 32 scalar K values per tile.
-template <int SharedStride>
+// A block produces 64x64 outputs, consuming TileK scalar K values per tile.
+template <int TileK, int SharedStride>
 __global__ void gemm_tiled(const int *a, const int *bt, int32_t *c, int m,
                            int k4, int n) {
+  static_assert(TileK == 32 || TileK == 64 || TileK == 128,
+                "unsupported K depth");
+  constexpr int PackedK = TileK / 4;
   static_assert(SharedStride == 65 || SharedStride == 68, "unsupported stride");
   // Stride 65 is the original baseline. Stride 68 maps the 32 stores of each
-  // warp to distinct banks for local=index/8 and lane=index%8.
-  __shared__ int shared_a[8][SharedStride];
-  __shared__ int shared_b[8][SharedStride];
+  // warp to distinct banks within each eight-group loading slab.
+  __shared__ int shared_a[PackedK][SharedStride];
+  __shared__ int shared_b[PackedK][SharedStride];
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
   const int tid = ty * 16 + tx;
@@ -36,22 +39,24 @@ __global__ void gemm_tiled(const int *a, const int *bt, int32_t *c, int m,
   const int col_base = blockIdx.x * 64;
   int acc[4][4] = {};
 
-  for (int base = 0; base < k4; base += 8) {
+  for (int base = 0; base < k4; base += PackedK) {
 #pragma unroll
-    for (int load = 0; load < 2; ++load) {
+    for (int load = 0; load < PackedK / 4; ++load) {
       const int index = tid + load * 256;
-      const int lane = index % 8;
-      const int local = index / 8;
-      const int group = base + lane;
+      // Preserve the original eight-group mapping in each 512-word slab.
+      // Increasing depth must not change the stride-68 bank distribution.
+      const int p = (index / 512) * 8 + index % 8;
+      const int local = (index % 512) / 8;
+      const int group = base + p;
       const int row = row_base + local;
       const int col = col_base + local;
-      shared_a[lane][local] = row < m && group < k4 ? a[row * k4 + group] : 0;
-      shared_b[lane][local] = col < n && group < k4 ? bt[col * k4 + group] : 0;
+      shared_a[p][local] = row < m && group < k4 ? a[row * k4 + group] : 0;
+      shared_b[p][local] = col < n && group < k4 ? bt[col * k4 + group] : 0;
     }
     __syncthreads();
 
 #pragma unroll
-    for (int p = 0; p < 8; ++p) {
+    for (int p = 0; p < PackedK; ++p) {
       int reg_a[4], reg_b[4];
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
@@ -81,6 +86,36 @@ __global__ void gemm_tiled(const int *a, const int *bt, int32_t *c, int m,
       }
     }
   }
+}
+
+struct Variant {
+  int tile_k;
+  int stride;
+};
+
+// K=32 occupies the first two entries, used as same-stride baselines.
+constexpr std::array<Variant, 6> variants{
+    {{32, 65}, {32, 68}, {64, 65}, {64, 68}, {128, 65}, {128, 68}}};
+
+static void launch_variant(const Variant &variant, dim3 grid, dim3 block,
+                           const int *a, const int *bt, int32_t *c, int m,
+                           int k4, int n) {
+#define LAUNCH_VARIANT(K, S)                                                   \
+  if (variant.tile_k == K && variant.stride == S) {                            \
+    gemm_tiled<K, S><<<grid, block>>>(a, bt, c, m, k4, n);                     \
+    CUDA_CHECK(cudaGetLastError());                                            \
+    return;                                                                    \
+  }
+  LAUNCH_VARIANT(32, 65)
+  LAUNCH_VARIANT(32, 68)
+  LAUNCH_VARIANT(64, 65)
+  LAUNCH_VARIANT(64, 68)
+  LAUNCH_VARIANT(128, 65)
+  LAUNCH_VARIANT(128, 68)
+#undef LAUNCH_VARIANT
+  std::fprintf(stderr, "Unsupported variant: TileK=%d stride=%d\n",
+               variant.tile_k, variant.stride);
+  std::exit(EXIT_FAILURE);
 }
 
 enum class Input { Random, Zero, Extremes };
@@ -209,7 +244,7 @@ template <typename Launch> static double median_ms(Launch launch) {
 }
 
 static bool run_case(cublasHandle_t handle, int m, int k, int n, Input input,
-                     bool benchmark) {
+                     bool benchmark, int campaign = 0) {
   const int k4 = (k + 3) / 4;
   std::vector<int8_t> a(size_t(m) * k), b(size_t(k) * n);
   std::vector<int> packed_a(size_t(m) * k4), packed_bt(size_t(n) * k4);
@@ -232,32 +267,28 @@ static bool run_case(cublasHandle_t handle, int m, int k, int n, Input input,
                         packed_bt.size() * sizeof(int),
                         cudaMemcpyHostToDevice));
   const dim3 block(16, 16), grid((n + 63) / 64, (m + 63) / 64);
-  const auto launch_tiled = [&](int stride) {
-    if (stride == 65) {
-      gemm_tiled<65><<<grid, block>>>(d_packed_a, d_packed_bt, d_c, m, k4, n);
-    } else {
-      gemm_tiled<68><<<grid, block>>>(d_packed_a, d_packed_bt, d_c, m, k4, n);
-    }
-    CUDA_CHECK(cudaGetLastError());
+  const auto launch_tiled = [&](const Variant &variant) {
+    launch_variant(variant, grid, block, d_packed_a, d_packed_bt, d_c, m, k4,
+                   n);
   };
   const char *label = input == Input::Random ? "random"
                       : input == Input::Zero ? "zeros"
                                              : "extremes";
   std::printf("\nM=%d K=%d N=%d input=%s\n", m, k, n, label);
-  const auto validate_tiled = [&](int stride) {
+  const auto validate_tiled = [&](const Variant &variant) {
     // Poison the reused output so omitted writes cannot inherit a prior result.
     CUDA_CHECK(cudaMemset(d_c, 0x80, c.size() * sizeof(int32_t)));
-    launch_tiled(stride);
+    launch_tiled(variant);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(c.data(), d_c, c.size() * sizeof(int32_t),
                           cudaMemcpyDeviceToHost));
     const bool valid = verify_cpu(a, b, c, m, k, n, benchmark);
-    std::printf("stride=%d CPU reference (%s): %s\n", stride,
-                benchmark ? "64 positions" : "all outputs",
+    std::printf("TileK=%d stride=%d CPU reference (%s): %s\n", variant.tile_k,
+                variant.stride, benchmark ? "64 positions" : "all outputs",
                 valid ? "PASS" : "FAIL");
     return valid;
   };
-  bool correct = validate_tiled(65);
+  bool correct = true;
 
   // The original row-major matrices satisfy cuBLAS alignment constraints only
   // for these shapes. Odd-sized correctness cases use the CPU reference alone.
@@ -286,44 +317,71 @@ static bool run_case(cublasHandle_t handle, int m, int k, int n, Input input,
     CUDA_CHECK(cudaMemcpy(blas_c.data(), d_blas_c,
                           blas_c.size() * sizeof(int32_t),
                           cudaMemcpyDeviceToHost));
-    const auto compare_outputs = [&](int stride) {
+    const auto compare_outputs = [&](const Variant &variant) {
       bool valid = true;
       for (size_t i = 0; i < c.size(); ++i) {
         if (c[i] != blas_c[i]) {
-          std::fprintf(
-              stderr,
-              "stride=%d cuBLAS mismatch at C[%zu,%zu]: tiled=%d cuBLAS=%d\n",
-              stride, i / n, i % n, int(c[i]), int(blas_c[i]));
+          std::fprintf(stderr,
+                       "TileK=%d stride=%d cuBLAS mismatch at C[%zu,%zu]: "
+                       "tiled=%d cuBLAS=%d\n",
+                       variant.tile_k, variant.stride, i / n, i % n, int(c[i]),
+                       int(blas_c[i]));
           valid = false;
           break;
         }
       }
-      std::printf("stride=%d cuBLAS reference (all outputs): %s\n", stride,
-                  valid ? "PASS" : "FAIL");
+      std::printf("TileK=%d stride=%d cuBLAS reference (all outputs): %s\n",
+                  variant.tile_k, variant.stride, valid ? "PASS" : "FAIL");
       return valid;
     };
-    correct = compare_outputs(65) && validate_tiled(68) && compare_outputs(68);
+    for (const auto &variant : variants) {
+      correct = validate_tiled(variant) && compare_outputs(variant);
+      if (!correct)
+        break;
+    }
     if (correct && benchmark) {
-      const double baseline_ms = median_ms([&]() { launch_tiled(65); });
-      const double padded_ms = median_ms([&]() { launch_tiled(68); });
-      const double blas_ms = median_ms(launch_blas);
+      // Rotate all seven backends, including cuBLAS, between campaigns.
+      std::array<double, 7> timings{};
+      for (int step = 0; step < 7; ++step) {
+        const int backend = (step + campaign * 2) % 7;
+        if (backend == 6) {
+          timings[backend] = median_ms(launch_blas);
+        } else {
+          timings[backend] =
+              median_ms([&]() { launch_tiled(variants[backend]); });
+        }
+      }
       const double operations = 2.0 * m * n * k;
+      const double blas_ms = timings[6];
       std::printf("CPU packing (excluded): %.3f ms\n", pack_ms);
-      std::printf("tiled stride=65: %.4f ms  %.4f TOPS\n", baseline_ms,
-                  operations / (baseline_ms * 1e9));
-      std::printf("tiled stride=68: %.4f ms  %.4f TOPS\n", padded_ms,
-                  operations / (padded_ms * 1e9));
+      std::printf("Timing order:");
+      for (int step = 0; step < 7; ++step) {
+        const int backend = (step + campaign * 2) % 7;
+        if (backend == 6)
+          std::printf(" cuBLAS");
+        else
+          std::printf(" K%d/S%d", variants[backend].tile_k,
+                      variants[backend].stride);
+      }
+      std::printf("\n");
+      for (size_t i = 0; i < variants.size(); ++i) {
+        const auto &variant = variants[i];
+        const double ms = timings[i];
+        const double baseline_ms = timings[variant.stride == 65 ? 0 : 1];
+        std::printf("tiled TileK=%d stride=%d: %.4f ms  %.4f TOPS  "
+                    "speedup_vs_K32=%.3f  cuBLAS=%.1f%%\n",
+                    variant.tile_k, variant.stride, ms, operations / (ms * 1e9),
+                    baseline_ms / ms, 100.0 * blas_ms / ms);
+      }
       std::printf("cuBLAS: %.4f ms  %.4f TOPS\n", blas_ms,
                   operations / (blas_ms * 1e9));
-      std::printf("stride=68 / stride=65 throughput: %.3f (speedup)\n",
-                  baseline_ms / padded_ms);
-      std::printf("stride=65 / cuBLAS throughput: %.3f (%.1f%%)\n",
-                  blas_ms / baseline_ms, 100.0 * blas_ms / baseline_ms);
-      std::printf("stride=68 / cuBLAS throughput: %.3f (%.1f%%)\n",
-                  blas_ms / padded_ms, 100.0 * blas_ms / padded_ms);
     }
   } else if (correct) {
-    correct = validate_tiled(68);
+    for (const auto &variant : variants) {
+      correct = validate_tiled(variant);
+      if (!correct)
+        break;
+    }
     std::printf("cuBLAS reference: skipped (unaligned shape)\n");
   }
 
@@ -364,9 +422,9 @@ int main(int argc, char **argv) {
   CUBLAS_CHECK(cublasSetStream(handle, nullptr));
   int version = 0;
   CUBLAS_CHECK(cublasGetVersion(handle, &version));
-  std::printf(
-      "cuBLAS version: %d\nTile: 64x64x32, 16x16 threads, 4x4 outputs/thread\n",
-      version);
+  std::printf("cuBLAS version: %d\nTile: 64x64, K depths 32/64/128, "
+              "16x16 threads, 4x4 outputs/thread\n",
+              version);
   std::printf("Shared strides: 65 (baseline), 68 (store-bank padding)\n");
   bool correct = true;
   if (check) {
@@ -378,6 +436,12 @@ int main(int argc, char **argv) {
               run_case(handle, 128, 65, 129, Input::Random, false);
     for (int k = 1; correct && k <= 7; ++k) {
       correct = run_case(handle, 3, k, 5, Input::Extremes, false);
+    }
+    for (int k : {31, 32, 33, 63, 64, 65, 127, 128, 129}) {
+      if (!correct)
+        break;
+      correct = run_case(handle, 65, k, 67, Input::Random, false) &&
+                run_case(handle, 65, k, 67, Input::Extremes, false);
     }
     for (int size : {128, 256, 512}) {
       if (!correct)
@@ -391,11 +455,14 @@ int main(int argc, char **argv) {
     constexpr int shapes[][3] = {{1024, 1024, 1024},  {2048, 2048, 2048},
                                  {4096, 4096, 4096},  {8192, 4096, 4096},
                                  {8192, 4096, 16384}, {8192, 16384, 4096}};
-    for (const auto &shape : shapes) {
-      correct =
-          run_case(handle, shape[0], shape[1], shape[2], Input::Random, true);
-      if (!correct)
-        break;
+    for (int campaign = 0; correct && campaign < 3; ++campaign) {
+      std::printf("\nCampaign %d/3 (rotated backend order)\n", campaign + 1);
+      for (const auto &shape : shapes) {
+        correct = run_case(handle, shape[0], shape[1], shape[2], Input::Random,
+                           true, campaign);
+        if (!correct)
+          break;
+      }
     }
   }
   CUBLAS_CHECK(cublasDestroy(handle));

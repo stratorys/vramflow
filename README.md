@@ -71,29 +71,37 @@ Record actual GPU output and environment details in [results/GTX1080.md](results
 ## Tiled GEMM and cuBLAS
 
 `src/02_gemm_tiled.cu` produces a 64×64 output tile per block, with 256 threads
-and 16 INT32 accumulators per thread. It stages 32 scalar K values at a time in
-shared memory, then uses signed DP4A in registers. A and transposed B are packed
-on CPU into four-byte groups along K; the final group is zero-padded. Output
-dimensions and K need not be multiples of the tile sizes.
+and 16 INT32 accumulators per thread. Six compile-time kernels compare scalar
+K depths 32, 64 and 128 at each shared-memory stride, 65 and 68. Each tile loads
+all its inputs, synchronizes, computes signed DP4A in registers, then synchronizes
+before shared memory is reused. Larger depths reduce the number of barriers,
+but may increase resource pressure; any throughput benefit must be measured.
 
-The executable compares two compile-time shared-memory strides: 65 (original
-baseline) and 68. For the cooperative store mapping, stride 68 distributes the
-32 words of a warp over distinct shared-memory banks; stride 65 can map four
-distinct words to the same bank. Both kernels use the same packed inputs,
-output buffer, tile dimensions and validation. Each variant is checked against
-CPU and, for aligned shapes, cuBLAS. Benchmark output includes both timings,
-the stride-68 speedup and each variant's throughput relative to cuBLAS. This
-isolates the padding change; its actual throughput benefit must be measured.
+A and transposed B are packed on CPU into four-byte groups along K; the final
+group is zero-padded. Output dimensions and K need not be multiples of the tile
+sizes. Cooperative loading preserves the original eight-group mapping in each
+512-word slab at every depth. With stride 68, the 32 words stored by a warp map
+to distinct shared-memory banks; stride 65 can map four distinct words to the
+same bank. The two shared arrays use 4,352 / 8,704 / 17,408 bytes at stride 68
+for K depths 32 / 64 / 128, respectively.
+
+All six variants use the same packed inputs, output buffer and validation.
+Each is checked against CPU and, for aligned shapes, cuBLAS. Compare depths
+at the same stride to isolate the depth change; K=32 is the baseline for each
+stride. Benchmark output includes time, TOPS, speedup against that baseline,
+and throughput as a percentage of cuBLAS.
 
 ```sh
 make check-gemm-tiled          # small cases, exhaustive CPU validation
 make run-gemm-tiled            # checks followed by the complete benchmark suite
 ./gemm_tiled --bench           # large benchmarks only
-make sass-gemm-tiled           # inspect both specializations for IDP.4A.S8.S8
+make sass-gemm-tiled           # inspect all six specializations for IDP.4A.S8.S8
 ```
 
 The small tests cover 128³/256³/512³, rectangular and tile-boundary cases, zeros,
-and signed extremes with K from 1 through 7. The large suite covers 1024³,
+and signed extremes with K from 1 through 7. Additional rectangular random and
+extreme-input tests cover K=31/32/33, 63/64/65 and 127/128/129 to exercise
+every depth boundary. The large suite covers 1024³,
 2048³, 4096³, and `(M,K,N)` = `(8192,4096,4096)`, `(8192,4096,16384)`, and
 `(8192,16384,4096)`. Each large output is compared exhaustively with cuBLAS and
 64 deterministic positions are also checked against an INT64 CPU reference.
@@ -104,12 +112,23 @@ buffers as column-major matrices. Small unaligned cases use the CPU reference
 alone; cuBLAS is mandatory for every large benchmark. Any backend error or
 numerical mismatch stops the run with a nonzero exit code.
 
-Both backends report the median of 20 CUDA event timings after five warmups.
+All backends report the median of 20 CUDA event timings after five warmups.
+The benchmark runs three complete campaigns over the same shapes and
+deterministic inputs, rotating the order of all seven backends (including
+cuBLAS) between campaigns. The order and campaign number are printed; timings
+and ratios are reported separately for each campaign.
 Allocation, H2D transfers, packing and validation are excluded. CPU packing time
 is reported separately; tiled throughput assumes weights are already packed.
 The throughput ratio compares GPU compute, not end-to-end inference. There is
 no automatic performance pass threshold: review the gap before proceeding to H2D.
-Compilation prints register usage and spills via ptxas for subsequent tuning.
+Compilation prints register usage, shared memory and spills via ptxas for each
+specialization. Archive these alongside the raw campaign output and environment
+versions. Retain a deeper tile only if its gain on large shapes reproduces across
+campaigns; if differences change sign or remain within observed run-to-run
+variation, retain K=32. The stage-02 selection target remains at least 50% of
+cuBLAS throughput on representative shapes. No buffering change is included in
+this experiment, and a depth speedup alone does not establish that barriers
+were the sole bottleneck.
 
 Optional sanitizer checks on the small suite:
 
